@@ -31,6 +31,22 @@ namespace SystemCleaner
         private static extern bool MoveFileEx(string lpExistingFileName, string? lpNewFileName, MoveFileExFlags dwFlags);
         // ============================================================================
 
+        // ================== P/INVOKE PARA LIXEIRA (SHEmptyRecycleBin) ===============
+        [Flags]
+        private enum RecycleFlags : uint
+        {
+            SHERB_NOCONFIRMATION = 0x00000001,
+            SHERB_NOPROGRESSUI = 0x00000002,
+            SHERB_NOSOUND = 0x00000004
+        }
+
+        [DllImport("Shell32.dll", CharSet = CharSet.Unicode)]
+        private static extern int SHEmptyRecycleBin(
+            IntPtr hwnd,
+            string? pszRootPath,
+            RecycleFlags dwFlags);
+        // ============================================================================
+
         private static void Main()
         {
             Console.Title = "System Cleaner - C# (FORCE)";
@@ -60,9 +76,11 @@ namespace SystemCleaner
 
             try
             {
-                CleanTempFolders();
-                CleanBrowserCaches();
-                CleanWindowsLogsBasic();
+                CleanTempFolders();          // Temp do usuário + Windows\Temp
+                CleanBrowserCaches();        // Chrome/Edge/Brave/Opera/Firefox
+                CleanWindowsLogsBasic();     // SoftwareDistribution\Download, Logs, Prefetch
+                CleanWindowsCacheFolders();  // DeliveryOptimization, WER, Diagnosis, Explorer, PRINTERS, Minidump
+                EmptyRecycleBin();           // Lixeira do Windows
             }
             catch (Exception ex)
             {
@@ -315,8 +333,8 @@ namespace SystemCleaner
 
                 var basicLogsFolders = new[]
                 {
-                    Path.Combine(windowsFolder, "SoftwareDistribution", "Download"),
-                    Path.Combine(windowsFolder, "Logs"),
+                    Path.Combine(windowsFolder, "SoftwareDistribution", "Download"), // Windows Update cache
+                    Path.Combine(windowsFolder, "Logs"),                            // inclui Logs\CBS
                     Path.Combine(windowsFolder, "Prefetch")
                 };
 
@@ -328,6 +346,97 @@ namespace SystemCleaner
             catch (Exception ex)
             {
                 LogError("Erro ao limpar logs/caches básicos do Windows", ex);
+            }
+        }
+
+        #endregion
+
+        #region Limpeza extra de caches do Windows (DeliveryOptimization, WER, Explorer, etc.)
+
+        private static void CleanWindowsCacheFolders()
+        {
+            Console.WriteLine();
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("=== LIMPANDO PASTAS DE CACHE ADICIONAIS DO WINDOWS ===");
+            Console.ResetColor();
+
+            try
+            {
+                var windowsFolder = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+                var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+
+                var extraFolders = new List<string>
+                {
+                    // Delivery Optimization
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                        "Microsoft", "Windows", "DeliveryOptimization"),
+
+                    // WER (Windows Error Reporting)
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                        "Microsoft", "Windows", "WER"),
+
+                    // Diagnosis
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                        "Microsoft", "Diagnosis"),
+
+                    // Cache de impressão
+                    Path.Combine(windowsFolder, "System32", "spool", "PRINTERS"),
+
+                    // Mini dumps (BSOD / falhas)
+                    Path.Combine(windowsFolder, "Minidump")
+                };
+
+                // Cache de miniaturas do Explorer
+                if (!string.IsNullOrWhiteSpace(localAppData))
+                {
+                    extraFolders.Add(Path.Combine(localAppData, "Microsoft", "Windows", "Explorer"));
+                }
+
+                foreach (var folder in extraFolders)
+                {
+                    CleanDirectoryContents(folder, "Windows Cache Extra");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError("Erro ao limpar caches adicionais do Windows", ex);
+            }
+        }
+
+        #endregion
+
+        #region Lixeira do Windows
+
+        private static void EmptyRecycleBin()
+        {
+            Console.WriteLine();
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("=== LIMPANDO LIXEIRA DO WINDOWS ===");
+            Console.ResetColor();
+
+            try
+            {
+                // null -> todas as unidades
+                var result = SHEmptyRecycleBin(
+                    IntPtr.Zero,
+                    null,
+                    RecycleFlags.SHERB_NOCONFIRMATION |
+                    RecycleFlags.SHERB_NOPROGRESSUI |
+                    RecycleFlags.SHERB_NOSOUND);
+
+                if (result != 0)
+                {
+                    _errors.Add($"Falha ao esvaziar Lixeira. Código de retorno: {result}");
+                    Console.WriteLine($"[AVISO] Não foi possível esvaziar a Lixeira. Código={result}");
+                }
+                else
+                {
+                    Console.WriteLine("Lixeira esvaziada com sucesso.");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError("Erro ao esvaziar Lixeira do Windows", ex);
             }
         }
 
@@ -379,7 +488,6 @@ namespace SystemCleaner
             }
             catch (IOException ex)
             {
-                // Arquivo em uso -> FORCE: agenda para delete no reboot
                 if (ScheduleDeleteOnReboot(file, isDirectory: false))
                 {
                     Console.WriteLine($"[FORCE] Arquivo em uso agendado para exclusão no reboot: {file}");
@@ -392,7 +500,6 @@ namespace SystemCleaner
             }
             catch (UnauthorizedAccessException ex)
             {
-                // Sem permissão agora -> tenta agendar para delete no reboot
                 if (ScheduleDeleteOnReboot(file, isDirectory: false))
                 {
                     Console.WriteLine($"[FORCE] Arquivo sem permissão agendado para exclusão no reboot: {file}");
@@ -432,7 +539,6 @@ namespace SystemCleaner
             }
             catch (IOException ex)
             {
-                // Pasta em uso -> agenda delete no reboot (FORCE)
                 if (ScheduleDeleteOnReboot(dir, isDirectory: true))
                 {
                     Console.WriteLine($"[FORCE] Pasta em uso agendada para exclusão no reboot: {dir}");
@@ -515,8 +621,6 @@ namespace SystemCleaner
                 if (!File.Exists(path) && !Directory.Exists(path))
                     return false;
 
-                // Para diretórios, o MoveFileEx também funciona, mas o Windows vai tentar
-                // remover tudo no boot. Se algo continuar em uso, pode sobrar lixo.
                 var ok = MoveFileEx(path, null, MoveFileExFlags.MOVEFILE_DELAY_UNTIL_REBOOT);
 
                 if (!ok)
